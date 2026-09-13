@@ -50,8 +50,10 @@ You can learn about the CLI options for this script in the `EvalPipelineConfig` 
 """
 
 import concurrent.futures as cf
+import hashlib
 import json
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -103,6 +105,24 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+EVAL_TRACE_PATH_ENV = "LEROBOT_EVAL_TRACE_PATH"
+
+
+def _trace_tensor_hashes(value: np.ndarray | Tensor) -> dict[str, Any]:
+    """Return batch and per-sample hashes without retaining rollout tensors."""
+    if isinstance(value, Tensor):
+        value = value.detach().contiguous().cpu().numpy()
+    array = np.ascontiguousarray(value)
+    per_sample = [
+        hashlib.sha256(np.ascontiguousarray(sample).tobytes()).hexdigest() for sample in array
+    ]
+    return {
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+        "batch_sha256": hashlib.sha256(array.tobytes()).hexdigest(),
+        "per_sample_sha256": per_sample,
+    }
 
 
 def _env_features_to_dataset_features(env_features: dict) -> dict:
@@ -216,6 +236,28 @@ def rollout(
     """
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
 
+    trace_path_value = os.environ.get(EVAL_TRACE_PATH_ENV)
+    trace_file = None
+    trace_model = None
+    original_sample_noise = None
+    last_noise_trace = None
+    if trace_path_value:
+        trace_path = Path(trace_path_value)
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_file = trace_path.open("w", encoding="utf-8")
+        trace_model = getattr(policy, "model", None)
+        sample_noise_fn = getattr(trace_model, "sample_noise", None)
+        if callable(sample_noise_fn):
+            original_sample_noise = sample_noise_fn
+
+            def traced_sample_noise(shape, device):
+                nonlocal last_noise_trace
+                noise = original_sample_noise(shape, device)
+                last_noise_trace = _trace_tensor_hashes(noise)
+                return noise
+
+            trace_model.sample_noise = traced_sample_noise
+
     # Reset the policy and environments.
     policy.reset()
     # NEW_ROLLOUT_OPTION tells FreezeAfterEpisodeEnd this is a genuine new episode, as
@@ -270,6 +312,17 @@ def rollout(
     check_env_attributes_and_types(env)
     try:
         while not np.all(done) and step < max_steps:
+            camera_trace = {}
+            if trace_file is not None:
+                pixels = observation.get("pixels")
+                if isinstance(pixels, dict):
+                    camera_trace = {
+                        name: _trace_tensor_hashes(image) for name, image in sorted(pixels.items())
+                    }
+                elif pixels is not None:
+                    camera_trace = {"pixels": _trace_tensor_hashes(pixels)}
+                last_noise_trace = None
+
             # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
             observation = preprocess_observation(observation)
             if return_observations:
@@ -302,6 +355,22 @@ def rollout(
             # Convert to CPU / numpy.
             action_numpy: np.ndarray = action.to("cpu").numpy()
             assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
+
+            if trace_file is not None:
+                trace_file.write(
+                    json.dumps(
+                        {
+                            "step": step,
+                            "done_before_step": done.tolist(),
+                            "cameras": camera_trace,
+                            "noise": last_noise_trace,
+                            "action": _trace_tensor_hashes(action_numpy),
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+                trace_file.flush()
 
             # Apply the next action.
             observation, reward, terminated, truncated, info = env.step(action_numpy)
@@ -378,6 +447,10 @@ def rollout(
             progbar.set_postfix({"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"})
             progbar.update()
     finally:
+        if original_sample_noise is not None and trace_model is not None:
+            trace_model.sample_noise = original_sample_noise
+        if trace_file is not None:
+            trace_file.close()
         if recording_datasets is not None:
             for ds in recording_datasets:
                 ds.finalize()

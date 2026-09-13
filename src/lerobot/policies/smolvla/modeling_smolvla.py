@@ -52,8 +52,11 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 """
 
+import logging
 import math
 from collections import deque
+from contextlib import nullcontext
+from pathlib import Path
 from typing import TypedDict, Unpack
 
 import torch
@@ -76,6 +79,18 @@ from ..utils import (
     populate_queues,
 )
 from .configuration_smolvla import SmolVLAConfig
+from .fp8 import (
+    FP8_WEIGHTS_NAME,
+    TransformerEngineFP8,
+    load_fp8_checkpoint,
+    pad_batch_dim_for_fp8,
+    setup_transformer_engine_fp8,
+)
+from .nvfp4 import (
+    TransformerEngineNVFP4,
+    pad_batch_dim_for_nvfp4,
+    setup_transformer_engine_nvfp4,
+)
 from .smolvlm_with_expert import SmolVLMWithExpertModel
 
 
@@ -166,6 +181,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
+
+    @classmethod
+    def _load_as_safetensor(cls, model, model_file: str, map_location: str, strict: bool):
+        """Load the standard safetensors checkpoint or an FP8-only TE checkpoint."""
+        if model.config.fp8_primary_weights:
+            fp8_file = Path(model_file).with_name(FP8_WEIGHTS_NAME)
+            return load_fp8_checkpoint(model, fp8_file, model.config, map_location=map_location)
+        return super()._load_as_safetensor(model, model_file, map_location, strict)
 
     def reset(self):
         """This should be called whenever the environment is reset."""
@@ -530,6 +553,43 @@ class VLAFlowMatching(nn.Module):
         self.prefix_length = self.config.prefix_length
         self.rtc_processor = rtc_processor
 
+        self._fp8: TransformerEngineFP8 | None = None
+        if config.use_fp8:
+            self._fp8 = setup_transformer_engine_fp8(self, config)
+            if config.fp8_fuse_layernorm:
+                # Select the fused or ordinary Text/Expert Q path once per layer. Frozen layers
+                # remain high precision and therefore keep the ordinary Norm->Linear path.
+                self.vlm_with_expert.configure_input_norm_and_query_dispatch()
+            logging.info(
+                "Enabled Transformer Engine FP8 for %d SmolVLA GEMM modules "
+                "(%d LayerNormLinear, %d Linear; FP8-only weights: %s).",
+                len(self._fp8.replaced_modules),
+                len(self._fp8.fused_modules),
+                len(self._fp8.replaced_modules) - len(self._fp8.fused_modules),
+                self._fp8.primary_weights,
+            )
+            if config.fp8_primary_weights:
+                self.requires_grad_(False)
+
+        self._nvfp4: TransformerEngineNVFP4 | None = None
+        if config.use_nvfp4:
+            self._nvfp4 = setup_transformer_engine_nvfp4(self, config)
+            self.vlm_with_expert.configure_input_norm_and_query_dispatch()
+            logging.info(
+                "Enabled Transformer Engine NVFP4 for %d SmolVLA GEMM modules "
+                "(%d fused LayerNormLinear, %d Linear; %d unsupported-shape Linear kept in BF16; "
+                "row alignment: %d; RHT disabled: %s, stochastic rounding disabled: %s, "
+                "2D weight quantization disabled: %s).",
+                len(self._nvfp4.replaced_modules),
+                len(self._nvfp4.fused_modules),
+                len(self._nvfp4.replaced_modules) - len(self._nvfp4.fused_modules),
+                len(self._nvfp4.skipped_modules),
+                self._nvfp4.row_alignment,
+                config.nvfp4_disable_rht,
+                config.nvfp4_disable_stochastic_rounding,
+                config.nvfp4_disable_2d_quantization,
+            )
+
         # Compile model if requested
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
@@ -689,6 +749,52 @@ class VLAFlowMatching(nn.Module):
     def forward(
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
     ) -> Tensor:
+        """Run the training forward inside TE FP8 autocast when configured.
+
+        The context exits before this method returns, so the trainer invokes backward outside the
+        autocast region as required by Transformer Engine.
+        """
+        original_batch_size = actions.shape[0]
+        # TE FP8 requires the flattened GEMM row dimension to be divisible by 8. Padding the batch
+        # once covers every training GEMM; low-batch inference pads each Linear locally instead.
+        fp8_batch_padding = (-original_batch_size) % 8 if self._fp8 is not None else 0
+        if fp8_batch_padding:
+            images = [pad_batch_dim_for_fp8(image, fp8_batch_padding) for image in images]
+            img_masks = [pad_batch_dim_for_fp8(mask, fp8_batch_padding) for mask in img_masks]
+            lang_tokens = pad_batch_dim_for_fp8(lang_tokens, fp8_batch_padding)
+            lang_masks = pad_batch_dim_for_fp8(lang_masks, fp8_batch_padding)
+            state = pad_batch_dim_for_fp8(state, fp8_batch_padding)
+            actions = pad_batch_dim_for_fp8(actions, fp8_batch_padding)
+            if noise is not None:
+                noise = pad_batch_dim_for_fp8(noise, fp8_batch_padding)
+            if time is not None:
+                time = pad_batch_dim_for_fp8(time, fp8_batch_padding)
+
+        nvfp4_runtime = getattr(self, "_nvfp4", None)
+        nvfp4_batch_padding = (
+            (-original_batch_size) % nvfp4_runtime.row_alignment if nvfp4_runtime is not None else 0
+        )
+        if nvfp4_batch_padding:
+            images = [pad_batch_dim_for_nvfp4(image, nvfp4_batch_padding) for image in images]
+            img_masks = [pad_batch_dim_for_nvfp4(mask, nvfp4_batch_padding) for mask in img_masks]
+            lang_tokens = pad_batch_dim_for_nvfp4(lang_tokens, nvfp4_batch_padding)
+            lang_masks = pad_batch_dim_for_nvfp4(lang_masks, nvfp4_batch_padding)
+            state = pad_batch_dim_for_nvfp4(state, nvfp4_batch_padding)
+            actions = pad_batch_dim_for_nvfp4(actions, nvfp4_batch_padding)
+            if noise is not None:
+                noise = pad_batch_dim_for_nvfp4(noise, nvfp4_batch_padding)
+            if time is not None:
+                time = pad_batch_dim_for_nvfp4(time, nvfp4_batch_padding)
+
+        fp8_context = self._fp8.autocast() if self._fp8 is not None else nullcontext()
+        nvfp4_context = nvfp4_runtime.autocast() if nvfp4_runtime is not None else nullcontext()
+        with fp8_context, nvfp4_context:
+            losses = self._forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        return losses[:original_batch_size]
+
+    def _forward(
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+    ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -724,6 +830,31 @@ class VLAFlowMatching(nn.Module):
         return losses
 
     def sample_actions(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        noise=None,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> Tensor:
+        """Run inference inside TE FP8 autocast.
+
+        TE Linear modules pad only their local flattened GEMM row dimension. Keeping the policy
+        batch unchanged avoids evaluating the full vision-language model on dummy samples during
+        low-batch inference.
+        """
+        fp8_context = self._fp8.autocast() if self._fp8 is not None else nullcontext()
+        nvfp4_runtime = getattr(self, "_nvfp4", None)
+        nvfp4_context = nvfp4_runtime.autocast() if nvfp4_runtime is not None else nullcontext()
+        with fp8_context, nvfp4_context:
+            actions = self._sample_actions(
+                images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            )
+        return actions
+
+    def _sample_actions(
         self,
         images,
         img_masks,

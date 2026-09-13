@@ -176,3 +176,10 @@ outputs/
 *.urdf
 *.xml
 *.part
+*.md
+/bin
+/etc
+/opt/lerobot/lib64
+/test1
+/share
+/fp8

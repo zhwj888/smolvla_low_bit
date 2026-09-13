@@ -106,6 +106,27 @@ class SmolVLAConfig(PreTrainedConfig):
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 
+    # Transformer Engine FP8 training. Parameters and non-GEMM operations remain in their original
+    # precision; eligible GEMM modules are selected below.
+    use_fp8: bool = False
+    fp8_recipe: str = "delayed"
+    fp8_format: str = "hybrid"
+    fp8_amax_history_len: int = 16
+    # Fuse supported trainable LayerNorm/RMSNorm→Linear paths with TE LayerNormLinear. Remaining
+    # trainable Linear modules use TE Linear; frozen modules stay in their original high precision.
+    fp8_fuse_layernorm: bool = False
+    # Inference-only mode. Transformer Engine Linear modules keep their primary weights in the
+    # recipe's quantized representation instead of retaining BF16/FP32 master weights.
+    fp8_primary_weights: bool = False
+
+    # Transformer Engine NVFP4 training through fused LayerNormLinear modules. This is independent
+    # from FP8 and retains BF16 master parameters. GB10/SM12x must use round-to-nearest because
+    # Transformer Engine 2.16's native stochastic-rounding conversion is SM100/SM103-specific.
+    use_nvfp4: bool = False
+    nvfp4_disable_stochastic_rounding: bool = True
+    nvfp4_disable_rht: bool = False
+    nvfp4_disable_2d_quantization: bool = False
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -119,6 +140,25 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+
+        if self.fp8_recipe not in ("delayed", "current", "blockwise", "mxfp8"):
+            raise ValueError(
+                "fp8_recipe must be one of 'delayed', 'current', 'blockwise', or 'mxfp8', "
+                f"got {self.fp8_recipe!r}."
+            )
+        if self.fp8_format not in ("e4m3", "hybrid"):
+            raise ValueError(f"fp8_format must be one of 'e4m3' or 'hybrid', got {self.fp8_format!r}.")
+        if self.fp8_amax_history_len <= 0:
+            raise ValueError(f"fp8_amax_history_len must be greater than 0, got {self.fp8_amax_history_len}.")
+        if self.fp8_primary_weights and not self.use_fp8:
+            raise ValueError("fp8_primary_weights=True requires use_fp8=True.")
+        if self.fp8_primary_weights and self.compile_model:
+            raise ValueError(
+                "FP8-only SmolVLA checkpoints cannot use torch.compile. Use Transformer Engine "
+                "CUDA graphs for static-shape inference instead."
+            )
+        if self.use_fp8 and self.use_nvfp4:
+            raise ValueError("use_fp8 and use_nvfp4 are mutually exclusive.")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

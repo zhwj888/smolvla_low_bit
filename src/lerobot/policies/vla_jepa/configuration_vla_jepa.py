@@ -93,7 +93,15 @@ class VLAJEPAConfig(PreTrainedConfig):
     gripper_threshold: float = 0.5
     torch_dtype: str = "bfloat16"
 
+    # The upstream VLA-JEPA LIBERO recipe uses differential learning rates:
+    # Qwen at 1e-5, the remaining backbone/world-model modules at 3e-5, and the
+    # action head at 1e-4. `optimizer_lr` remains the optimizer/scheduler peak
+    # LR for backward-compatible checkpoint loading; every trainable parameter
+    # receives an explicit per-group LR in VLAJEPAPolicy.get_optim_params().
     optimizer_lr: float = 1e-4
+    optimizer_lr_qwen: float = 1e-5
+    optimizer_lr_base: float = 3e-5
+    optimizer_lr_action: float = 1e-4
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-10
@@ -104,6 +112,14 @@ class VLAJEPAConfig(PreTrainedConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        optimizer_lrs = {
+            "optimizer_lr": self.optimizer_lr,
+            "optimizer_lr_qwen": self.optimizer_lr_qwen,
+            "optimizer_lr_base": self.optimizer_lr_base,
+            "optimizer_lr_action": self.optimizer_lr_action,
+        }
+        if invalid := {name: lr for name, lr in optimizer_lrs.items() if lr <= 0}:
+            raise ValueError(f"VLA-JEPA optimizer learning rates must be positive, got {invalid}.")
         if self.freeze_qwen and self.enable_world_model:
             # freezing qwen backbone makes world model training irrelevant since no grad flows
             self.enable_world_model = False

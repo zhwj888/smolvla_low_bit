@@ -28,6 +28,7 @@ else:
     Qwen3VLForConditionalGeneration = None
 
 from .configuration_vla_jepa import VLAJEPAConfig
+from .qwen3vl_attention import fuse_qwen3vl_text_qkv
 
 
 class Qwen3VLInterface(torch.nn.Module):
@@ -38,6 +39,8 @@ class Qwen3VLInterface(torch.nn.Module):
             config.qwen_model_name,
             torch_dtype=self._get_torch_dtype(config.torch_dtype),
         )
+        qwen_model = getattr(self.model, "model", self.model)
+        fuse_qwen3vl_text_qkv(qwen_model.language_model)
         self.processor = AutoProcessor.from_pretrained(config.qwen_model_name)
         self.processor.tokenizer.padding_side = config.tokenizer_padding_side
         self.model.config.hidden_size = self.model.config.text_config.hidden_size

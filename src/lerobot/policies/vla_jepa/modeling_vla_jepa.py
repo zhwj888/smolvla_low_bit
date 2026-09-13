@@ -435,8 +435,37 @@ class VLAJEPAPolicy(PreTrainedPolicy):
         logs["loss"] = total_loss.detach().item()
         return total_loss, logs
 
-    def get_optim_params(self) -> dict:
-        return self.model.parameters()
+    def get_optim_params(self) -> list[dict[str, Any]]:
+        """Return the differential-LR groups used by the upstream LIBERO recipe."""
+        qwen_params = [parameter for parameter in self.model.qwen.parameters() if parameter.requires_grad]
+        action_params = [
+            parameter for parameter in self.model.action_model.parameters() if parameter.requires_grad
+        ]
+        specialized_param_ids = {id(parameter) for parameter in (*qwen_params, *action_params)}
+        base_params = [
+            parameter
+            for parameter in self.model.parameters()
+            if parameter.requires_grad and id(parameter) not in specialized_param_ids
+        ]
+
+        param_groups = [
+            {
+                "params": action_params,
+                "lr": self.config.optimizer_lr_action,
+                "name": "action",
+            },
+            {
+                "params": qwen_params,
+                "lr": self.config.optimizer_lr_qwen,
+                "name": "qwen",
+            },
+            {
+                "params": base_params,
+                "lr": self.config.optimizer_lr_base,
+                "name": "base",
+            },
+        ]
+        return [group for group in param_groups if group["params"]]
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:

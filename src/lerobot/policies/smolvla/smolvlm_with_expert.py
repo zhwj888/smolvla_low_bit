@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+from types import MethodType
 from typing import TYPE_CHECKING
 
 import torch
@@ -217,6 +218,46 @@ class SmolVLMWithExpertModel(nn.Module):
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.get_vlm_model().text_model.get_input_embeddings()(tokens)
 
+    @staticmethod
+    def _input_norm_and_query(layer, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return normalized hidden state and Q for the ordinary unfused path."""
+        q_proj = layer.self_attn.q_proj
+        hidden_states = layer.input_layernorm(hidden_states)
+        hidden_states = hidden_states.to(dtype=q_proj.weight.dtype)
+        return hidden_states, q_proj(hidden_states)
+
+    @staticmethod
+    def _fused_input_norm_and_query(
+        layer, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return normalized hidden state and Q for the preselected LayerNormLinear path."""
+        q_proj = layer.self_attn.q_proj
+        hidden_states = hidden_states.to(q_proj.layer_norm_weight.dtype)
+        query_state, hidden_states = q_proj(hidden_states)
+        return hidden_states, query_state
+
+    @staticmethod
+    def _dispatched_input_norm_and_query(
+        layer, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Call the fused or unfused implementation selected once for this layer."""
+        return layer._smolvla_input_norm_and_query(hidden_states)
+
+    def configure_input_norm_and_query_dispatch(self) -> None:
+        """Bind each Text/Expert layer to its matching Q projection implementation."""
+        ordinary_forward = type(self)._input_norm_and_query
+        fused_forward = type(self)._fused_input_norm_and_query
+        layers = (*self.get_vlm_model().text_model.layers, *self.lm_expert.layers)
+        for layer in layers:
+            q_proj = layer.self_attn.q_proj
+            forward = (
+                fused_forward
+                if getattr(q_proj, "_te_fused_norm_linear", False)
+                else ordinary_forward
+            )
+            layer._smolvla_input_norm_and_query = MethodType(forward, layer)
+        self._input_norm_and_query = self._dispatched_input_norm_and_query
+
     def forward_attn_layer(
         self,
         model_layers,
@@ -236,13 +277,12 @@ class SmolVLMWithExpertModel(nn.Module):
             layer = model_layers[i][layer_idx]
             if hidden_states is None or layer is None:
                 continue
-            hidden_states = layer.input_layernorm(hidden_states)
+            hidden_states, query_projection = self._input_norm_and_query(layer, hidden_states)
 
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
-            hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
-            query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
+            query_state = query_projection.view(hidden_shape)
             key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
             value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
 
@@ -314,13 +354,12 @@ class SmolVLMWithExpertModel(nn.Module):
 
             layer = model_layers[0][layer_idx]
 
-            hidden_states = layer.input_layernorm(inputs_embeds[0])
+            hidden_states, query_projection = self._input_norm_and_query(layer, inputs_embeds[0])
 
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
-            hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
-            query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
+            query_state = query_projection.view(hidden_shape)
             key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
             value_states = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
 
@@ -346,13 +385,14 @@ class SmolVLMWithExpertModel(nn.Module):
         # Expert
         expert_layer = model_layers[1][layer_idx]
         if expert_layer is not None:
-            expert_hidden_states = expert_layer.input_layernorm(inputs_embeds[1])
+            expert_hidden_states, expert_query_projection = self._input_norm_and_query(
+                expert_layer, inputs_embeds[1]
+            )
 
             expert_input_shape = expert_hidden_states.shape[:-1]
             expert_hidden_shape = (*expert_input_shape, -1, expert_layer.self_attn.head_dim)
 
-            expert_hidden_states = expert_hidden_states.to(dtype=expert_layer.self_attn.q_proj.weight.dtype)
-            expert_query_state = expert_layer.self_attn.q_proj(expert_hidden_states).view(expert_hidden_shape)
+            expert_query_state = expert_query_projection.view(expert_hidden_shape)
 
             # reshape (not view): K/V read back from the cache are transposed, hence non-contiguous
             _key_states = key_states.to(dtype=expert_layer.self_attn.k_proj.weight.dtype).reshape(

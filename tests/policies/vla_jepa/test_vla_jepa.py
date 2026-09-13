@@ -77,6 +77,29 @@ def test_training_forward_pass(patch_vla_jepa_external_models: None) -> None:
             assert value == batch_before[key]
 
 
+def test_optimizer_uses_official_differential_learning_rates(
+    patch_vla_jepa_external_models: None,
+) -> None:
+    config = make_config()
+    policy = VLAJEPAPolicy(config)
+
+    param_groups = policy.get_optim_params()
+    groups_by_name = {group["name"]: group for group in param_groups}
+
+    assert groups_by_name["qwen"]["lr"] == config.optimizer_lr_qwen == 1e-5
+    assert groups_by_name["base"]["lr"] == config.optimizer_lr_base == 3e-5
+    assert groups_by_name["action"]["lr"] == config.optimizer_lr_action == 1e-4
+
+    grouped_param_ids = [id(parameter) for group in param_groups for parameter in group["params"]]
+    trainable_param_ids = [id(parameter) for parameter in policy.parameters() if parameter.requires_grad]
+    assert len(grouped_param_ids) == len(set(grouped_param_ids))
+    assert set(grouped_param_ids) == set(trainable_param_ids)
+
+    optimizer = config.get_optimizer_preset().build(param_groups)
+    optimizer_lrs = {group["name"]: group["lr"] for group in optimizer.param_groups}
+    assert optimizer_lrs == {"action": 1e-4, "qwen": 1e-5, "base": 3e-5}
+
+
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 def test_training_forward_various_batch_sizes(patch_vla_jepa_external_models: None, batch_size: int) -> None:
     set_seed_all(42)

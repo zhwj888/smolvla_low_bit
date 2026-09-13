@@ -150,7 +150,7 @@ def update_policy(
         grad_clip_norm (float): The maximum norm for gradient clipping (no clipping when <= 0).
         accelerator (Accelerator): The Accelerator instance for distributed training and mixed precision.
         lr_scheduler (LRScheduler | None, optional): An optional learning rate scheduler, stepped once
-            per micro-batch. Defaults to None.
+            per optimizer update. Defaults to None.
         lock (Lock | None, optional): An optional lock for thread-safe optimizer updates.
             Defaults to None.
         sample_weighter (SampleWeighter | None, optional): Optional SampleWeighter instance for
@@ -216,9 +216,10 @@ def update_policy(
         with lock if lock is not None else nullcontext():
             optimizer.step()
         optimizer.zero_grad()
-
-        # Step through pytorch scheduler at every batch instead of epoch
-        if lr_scheduler is not None:
+        # Keep LR schedules in optimizer-update units under gradient accumulation. On non-sync
+        # micro-batches AcceleratedOptimizer.step() is a no-op, so advancing the scheduler there
+        # both compresses the schedule and triggers PyTorch's scheduler-before-optimizer warning.
+        if lr_scheduler is not None and accelerator.sync_gradients:
             lr_scheduler.step()
 
     # Update internal buffers if policy has update method. These track optimizer updates
