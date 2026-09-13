@@ -1,0 +1,5 @@
+# Independent ModelOpt PTQ / AutoQuant / QAD path; TE is not required.
+-r requirements.txt
+# Scoped AutoQuant budgets target the ModelOpt 0.45 implementation.
+# Torch quantization is included in this version's base package.
+nvidia-modelopt==0.45.0

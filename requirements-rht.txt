@@ -1,0 +1,5 @@
+# Install after PyTorch / ModelOpt and setuptools, wheel, ninja are available.
+# Requires a compatible CUDA Toolkit / nvcc and C++ toolchain.
+# python -m pip install --no-build-isolation -r requirements-rht.txt
+# Pinned to the source revision recorded in this workspace's installed distribution.
+fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@e7706faf8d1c3b9f241e36860640ad1dac644ede

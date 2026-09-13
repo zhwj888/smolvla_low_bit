@@ -1,0 +1,2 @@
+# Base SmolVLA. Run from the repository root; dependency ranges live in pyproject.toml.
+-e .[smolvla]
